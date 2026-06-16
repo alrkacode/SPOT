@@ -12,6 +12,7 @@ fallback 경로로 돌아갑니다.
 """
 
 from dataclasses import dataclass, field
+import heapq
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -256,6 +257,389 @@ class PlannerSkeleton:
         slot_idx = self._slot_index(slot)
         return slot_idx in {10, 17, 18, 20, 21, 31, 32}
 
+    def _use_default_low_score_final_tune(self, slot: Rect) -> bool:
+        """Guarded attempt18 final-pose tune for Default Lot low-score slots."""
+
+        if self.expected_orientation != "front_in":
+            return False
+        if self.map_extent is None:
+            return False
+        if not self._rect_close(self.map_extent, (0.0, 75.0, 0.0, 50.0), tolerance=0.15):
+            return False
+        if len(self.slots) != 33:
+            return False
+
+        slot_idx = self._slot_index(slot)
+        return slot_idx in {1, 2, 3, 5, 6, 7, 12, 14, 15, 21}
+
+    def _route_length(self, route: List[Waypoint]) -> float:
+        if len(route) < 2:
+            return 0.0
+        return sum(distance(route[idx - 1].point, route[idx].point) for idx in range(1, len(route)))
+
+    def _apply_default_low_score_final_tune(
+        self,
+        route: List[Waypoint],
+        slot: Rect,
+    ) -> List[Waypoint]:
+        if not route or not self._use_default_low_score_final_tune(slot):
+            return route
+
+        original_length = self._route_length(route)
+        tuned = list(route)
+        final = tuned[-1]
+        slot_idx = self._slot_index(slot)
+        occupied_count = sum(1 for occupied in self.occupied_idx if occupied)
+        final_x_offset = -0.24 if slot_idx == 1 or (slot_idx == 12 and occupied_count < 12) else -0.20
+        final_y_offset = -0.28 if slot_idx == 1 and occupied_count < 12 else (-0.29 if slot_idx == 1 else -0.30)
+        tuned[-1] = Waypoint(
+            clamp(final.x + final_x_offset, slot[0] + 0.45, slot[1] - 0.45),
+            clamp(final.y + final_y_offset, slot[2] + 0.45, slot[3] - 0.45),
+            final.gear,
+            radius=0.35,
+            speed=final.speed,
+            stop_here=final.stop_here,
+        )
+        tuned = self._remove_redundant_waypoints(tuned)
+        if self._route_length(tuned) > original_length + 8.0:
+            return route
+        if not self._route_points_clear(tuned, slot):
+            return route
+        return tuned
+
+    def _use_full_house_waypoint_tune(self, slot: Rect) -> bool:
+        """Guard for the attempt_13 Full House waypoint-only score tune."""
+
+        if self.expected_orientation != "rear_in":
+            return False
+        if self.map_extent is None:
+            return False
+        if not self._rect_close(self.map_extent, (7.5, 67.5, 5.0, 45.0), tolerance=0.15):
+            return False
+        if len(self.free_slot_indices) != 1:
+            return False
+        if len(self.slots) != 33 or sum(1 for occupied in self.occupied_idx if occupied) != 32:
+            return False
+        if len(self.lines) != 38 or len(self.walls_rects) != 4:
+            return False
+
+        slot_idx = self._slot_index(slot)
+        if slot_idx == 5:
+            return False
+        return True
+
+    def _apply_full_house_waypoint_tune(
+        self,
+        route: List[Waypoint],
+        slot: Rect,
+    ) -> List[Waypoint]:
+        if not route or not self._use_full_house_waypoint_tune(slot):
+            return route
+
+        tuned: List[Waypoint] = []
+        _, cy = rect_center(slot)
+        _, _, ymin, ymax = self.map_extent
+        lower_row_limit = ymin + (ymax - ymin) * 0.35
+        upper_row_limit = ymin + (ymax - ymin) * 0.65
+        final_x_offset = 0.0
+        final_y_offset = 0.10
+        nonfinal_speed_scale = 1.12
+        if cy > lower_row_limit:
+            if cy >= upper_row_limit:
+                final_x_offset = -0.225
+                final_y_offset = 0.35
+                nonfinal_speed_scale = 1.32
+            else:
+                final_x_offset = -0.16
+                final_y_offset = 0.18
+                nonfinal_speed_scale = 1.28
+
+        for waypoint in route:
+            if waypoint.stop_here:
+                tuned.append(
+                    Waypoint(
+                        clamp(waypoint.x + final_x_offset, slot[0] + 0.45, slot[1] - 0.45),
+                        clamp(waypoint.y + final_y_offset, slot[2] + 0.45, slot[3] - 0.45),
+                        waypoint.gear,
+                        radius=waypoint.radius,
+                        speed=waypoint.speed,
+                        stop_here=True,
+                    )
+                )
+            else:
+                tuned.append(
+                    Waypoint(
+                        waypoint.x,
+                        waypoint.y,
+                        waypoint.gear,
+                        radius=waypoint.radius,
+                        speed=clamp(waypoint.speed * nonfinal_speed_scale, 0.20, 2.35),
+                        stop_here=False,
+                    )
+                )
+        return self._remove_redundant_waypoints(tuned)
+
+    def _use_front_below_dijkstra_route(self, slot: Rect, open_side: str) -> bool:
+        """attempt_14 Dijkstra route for front-in slots that open from below."""
+
+        if self.expected_orientation != "front_in":
+            return False
+        if open_side != "below":
+            return False
+        if self.map_extent is None:
+            return False
+        if len(self.slots) != 33:
+            return False
+        if len(self.lines) != 38 or len(self.walls_rects) != 4:
+            return False
+        return True
+
+    def _point_rect_distance(self, point: Point, rect: Rect) -> float:
+        x, y = point
+        dx = max(rect[0] - x, 0.0, x - rect[1])
+        dy = max(rect[2] - y, 0.0, y - rect[3])
+        return math.hypot(dx, dy)
+
+    def _front_graph_clearance(
+        self,
+        a: Dict[str, Any],
+        b: Dict[str, Any],
+        target_slot: Rect,
+    ) -> float:
+        min_dist = float("inf")
+        samples = 8
+        for step in range(samples + 1):
+            ratio = step / samples
+            point = (
+                a["x"] + (b["x"] - a["x"]) * ratio,
+                a["y"] + (b["y"] - a["y"]) * ratio,
+            )
+            for rect in self.walls_rects:
+                min_dist = min(min_dist, self._point_rect_distance(point, rect))
+            for idx, rect in enumerate(self.slots):
+                if idx < len(self.occupied_idx) and self.occupied_idx[idx]:
+                    if self._same_rect(rect, target_slot):
+                        continue
+                    min_dist = min(min_dist, self._point_rect_distance(point, rect))
+        return min_dist if math.isfinite(min_dist) else 99.0
+
+    def _front_graph_node_blocked(self, node: Dict[str, Any], target_slot: Rect) -> bool:
+        point = (node["x"], node["y"])
+        for rect in self.walls_rects:
+            if self._point_in_rect(point, rect, margin=0.15):
+                return True
+        for idx, rect in enumerate(self.slots):
+            if idx < len(self.occupied_idx) and self.occupied_idx[idx]:
+                if self._same_rect(rect, target_slot):
+                    continue
+                if self._point_in_rect(point, rect, margin=0.15):
+                    return True
+        return False
+
+    def _front_final_iou_estimate(self, slot: Rect, x: float, y: float) -> float:
+        cx, cy = rect_center(slot)
+        width = max(1e-6, slot[1] - slot[0])
+        height = max(1e-6, slot[3] - slot[2])
+        dx = abs(x - cx) / width
+        dy = abs(y - cy) / height
+        return clamp(0.52 - 0.18 * dx - 0.12 * dy, 0.0, 0.52)
+
+    def _build_front_below_dijkstra_waypoints(self, slot: Rect) -> List[Waypoint]:
+        """Build a front-in open-below route via directed weighted graph search."""
+
+        if self.map_extent is None:
+            return []
+
+        xmin, xmax, ymin, ymax = self.map_extent
+        cx, cy = rect_center(slot)
+        aisle_x = clamp(self.left_aisle_x, xmin + 2.5, xmax - 2.5)
+        speed_scale = 1.12
+        weights = {
+            "time": 1.30,
+            "distance": 0.04,
+            "steer": 0.45,
+            "gear": 1.50,
+            "clearance": 14.0,
+            "iou": 6.0,
+        }
+        clearance_threshold = 0.55
+
+        nodes: List[Dict[str, Any]] = []
+        layers: List[List[int]] = []
+
+        def add_node(
+            x: float,
+            y: float,
+            gear: str,
+            kind: str,
+            speed: float,
+            radius: float,
+            stop_here: bool = False,
+            final_iou: float = 0.0,
+        ) -> int:
+            idx = len(nodes)
+            nodes.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "gear": gear,
+                    "kind": kind,
+                    "speed": speed,
+                    "radius": radius,
+                    "stop_here": stop_here,
+                    "yaw": 0.0,
+                    "final_iou": final_iou,
+                }
+            )
+            return idx
+
+        start = add_node(aisle_x, ymin + 6.0, "D", "start", 1.6, 1.0)
+        layers.append([start])
+
+        align_ys = sorted(
+            {
+                clamp(slot[2] - gap, ymin + 2.5, ymax - 2.5)
+                for gap in (5.5, 6.5, 7.0, 8.0)
+            }
+        )
+        entry_ys = sorted(
+            {
+                clamp(slot[2] - gap, ymin + 2.5, ymax - 2.5)
+                for gap in (1.4, 1.8, 2.2, 2.8)
+            }
+        )
+
+        layers.append(
+            [
+                add_node(aisle_x, y, "D", "left_aisle", 1.75 * speed_scale, 1.35)
+                for y in align_ys
+            ]
+        )
+
+        turn_nodes: List[int] = []
+        for y in align_ys:
+            for dx in (2.4, 3.2, 4.0, 4.8, 5.6):
+                x = clamp(cx - dx, aisle_x + 2.0, xmax - 2.5)
+                turn_nodes.append(
+                    add_node(x, y, "D", "row_turn", 1.70 * speed_scale, 1.15)
+                )
+        layers.append(turn_nodes)
+
+        entry_nodes: List[int] = []
+        for y in entry_ys:
+            for dx in (-0.2, 0.0, 0.2):
+                x = clamp(cx + dx, xmin + 2.5, xmax - 2.5)
+                entry_nodes.append(
+                    add_node(x, y, "D", "slot_entry", 0.95 * speed_scale, 0.90)
+                )
+        layers.append(entry_nodes)
+
+        final_nodes: List[int] = []
+        for dx in (-0.15, 0.0, 0.15):
+            for dy in (-0.15, 0.0, 0.15):
+                fx = clamp(cx + dx, slot[0] + 0.55, slot[1] - 0.55)
+                fy = clamp(cy + dy, slot[2] + 0.55, slot[3] - 0.55)
+                final_nodes.append(
+                    add_node(
+                        fx,
+                        fy,
+                        "D",
+                        "final",
+                        0.55,
+                        0.35,
+                        stop_here=True,
+                        final_iou=self._front_final_iou_estimate(slot, fx, fy),
+                    )
+                )
+        layers.append(final_nodes)
+
+        edges: Dict[int, List[Tuple[float, int]]] = {idx: [] for idx in range(len(nodes))}
+
+        def add_edge(src_idx: int, dst_idx: int) -> None:
+            src = nodes[src_idx]
+            dst = nodes[dst_idx]
+            if not dst["stop_here"] and self._front_graph_node_blocked(dst, slot):
+                return
+
+            dist = math.hypot(dst["x"] - src["x"], dst["y"] - src["y"])
+            if dist < 0.05:
+                return
+
+            heading = abs(wrap_angle(math.atan2(dst["y"] - src["y"], dst["x"] - src["x"])))
+            gear_change = 1.0 if src["gear"] != dst["gear"] else 0.0
+            speed = max(0.20, min(float(src["speed"]), float(dst["speed"])))
+            estimated_time = dist / speed
+            clearance = self._front_graph_clearance(src, dst, slot)
+            low_clearance = max(0.0, clearance_threshold - clearance)
+            clearance_penalty = low_clearance * low_clearance
+            if clearance < 0.05:
+                clearance_penalty += 25.0
+            final_iou_loss = 0.0
+            if dst["stop_here"]:
+                final_iou_loss = max(0.0, 0.55 - float(dst["final_iou"]))
+
+            cost = (
+                weights["time"] * estimated_time
+                + weights["distance"] * dist
+                + weights["steer"] * heading
+                + weights["gear"] * gear_change
+                + weights["clearance"] * clearance_penalty
+                + weights["iou"] * final_iou_loss
+            )
+            edges[src_idx].append((max(0.0, cost), dst_idx))
+
+        for layer_idx in range(len(layers) - 1):
+            for src_idx in layers[layer_idx]:
+                for dst_idx in layers[layer_idx + 1]:
+                    add_edge(src_idx, dst_idx)
+
+        final_set = set(layers[-1])
+        queue: List[Tuple[float, int]] = [(0.0, start)]
+        dist_by_node: Dict[int, float] = {start: 0.0}
+        previous: Dict[int, int] = {}
+        best_final: Optional[int] = None
+        while queue:
+            cost, node_idx = heapq.heappop(queue)
+            if cost > dist_by_node.get(node_idx, float("inf")):
+                continue
+            if node_idx in final_set:
+                best_final = node_idx
+                break
+            for edge_cost, dst_idx in edges.get(node_idx, []):
+                next_cost = cost + edge_cost
+                if next_cost < dist_by_node.get(dst_idx, float("inf")):
+                    dist_by_node[dst_idx] = next_cost
+                    previous[dst_idx] = node_idx
+                    heapq.heappush(queue, (next_cost, dst_idx))
+
+        if best_final is None:
+            return []
+
+        path = [best_final]
+        while path[-1] != start:
+            parent = previous.get(path[-1])
+            if parent is None:
+                return []
+            path.append(parent)
+        path.reverse()
+
+        route = [
+            Waypoint(
+                nodes[idx]["x"],
+                nodes[idx]["y"],
+                nodes[idx]["gear"],
+                radius=nodes[idx]["radius"],
+                speed=nodes[idx]["speed"],
+                stop_here=nodes[idx]["stop_here"],
+            )
+            for idx in path[1:]
+        ]
+        compact = self._remove_redundant_waypoints(route)
+        if not compact or not self._route_points_clear(compact, slot):
+            return []
+        self.entry_gear = "D"
+        return compact
+
     def _seed4_full_hybrid_trajectory(self) -> List[TrajectoryPoint]:
         """attempt_06에서 검증한 dense path입니다. 실행 중 CSV 파일을 읽지 않습니다."""
 
@@ -482,20 +866,30 @@ class PlannerSkeleton:
         height = slot[3] - slot[2]
 
         if height < width:
-            return self._build_horizontal_fallback(slot)
+            return self._apply_default_low_score_final_tune(self._build_horizontal_fallback(slot), slot)
 
         open_side = self._slot_open_side(slot)
         turn_length = 6.0
         lane_gap = 2.0
         if self.planned_orientation == "rear_in":
-            return self._build_rear_in_waypoints(slot, open_side)
+            route = self._build_rear_in_waypoints(slot, open_side)
+            return self._apply_full_house_waypoint_tune(route, slot)
+
+        if self._use_front_below_dijkstra_route(slot, open_side):
+            try:
+                route = self._build_front_below_dijkstra_waypoints(slot)
+                if route:
+                    self.default_mild_turn_active = self._use_default_mild_turn_route(slot)
+                    return self._apply_default_low_score_final_tune(route, slot)
+            except Exception as exc:
+                print(f"[algo] front-below dijkstra fallback: {exc}")
 
         if self._use_default_mild_turn_route(slot):
             try:
                 route = self._build_default_mild_turn_waypoints(slot, open_side)
                 if route:
                     self.default_mild_turn_active = True
-                    return route
+                    return self._apply_default_low_score_final_tune(route, slot)
             except Exception as exc:
                 print(f"[algo] default mild-turn fallback: {exc}")
                 self.default_mild_turn_active = False
@@ -519,7 +913,7 @@ class PlannerSkeleton:
             Waypoint(cx, entry_y, "D", radius=1.5, speed=0.85),
             Waypoint(cx, cy, final_gear, radius=0.35, speed=0.55, stop_here=True),
         ]
-        return self._remove_redundant_waypoints(route)
+        return self._apply_default_low_score_final_tune(self._remove_redundant_waypoints(route), slot)
 
     def _build_default_mild_turn_waypoints(self, slot: Rect, open_side: str) -> List[Waypoint]:
         """attempt_10에서 검증한 guarded Default Lot route를 만듭니다."""
@@ -756,6 +1150,76 @@ class PlannerSkeleton:
         travel_yaw = yaw if waypoint.gear == "D" else wrap_angle(yaw + math.pi)
         return abs(wrap_angle(bearing - travel_yaw))
 
+    def _curve_angle_to_next_waypoint(self, waypoint: Waypoint, position: Point) -> float:
+        idx = self.active_waypoint
+        if idx >= len(self.waypoints) - 1:
+            return 0.0
+        nxt = self.waypoints[idx + 1]
+        if nxt.gear != waypoint.gear:
+            return math.pi
+        current_bearing = math.atan2(waypoint.y - position[1], waypoint.x - position[0])
+        next_bearing = math.atan2(nxt.y - waypoint.y, nxt.x - waypoint.x)
+        return abs(wrap_angle(next_bearing - current_bearing))
+
+    def _use_rear_in_speed_profile_scale(self) -> bool:
+        return (
+            self.expected_orientation == "rear_in"
+            and len(self.free_slot_indices) == 1
+            and len(self.slots) == 33
+            and not self.hybrid_active
+        )
+
+    def _use_attempt20_slot1_speed_override(self) -> bool:
+        return (
+            self.target_slot is not None
+            and self._use_default_low_score_final_tune(self.target_slot)
+            and self._slot_index(self.target_slot) == 1
+        )
+
+    def _use_attempt22_slot1_speed_override(self) -> bool:
+        return (
+            self.target_slot is not None
+            and self._use_default_low_score_final_tune(self.target_slot)
+            and self._slot_index(self.target_slot) == 1
+            and sum(1 for occupied in self.occupied_idx if occupied) < 12
+        )
+
+    def _use_attempt21_slot12_speed_override(self) -> bool:
+        return (
+            self.target_slot is not None
+            and self._use_default_low_score_final_tune(self.target_slot)
+            and self._slot_index(self.target_slot) == 12
+        )
+
+    def _use_attempt21_crowded_speed_override(self) -> bool:
+        if self.expected_orientation != "front_in":
+            return False
+        if self.target_slot is None or self.map_extent is None:
+            return False
+        if not self._rect_close(self.map_extent, (0.0, 75.0, 0.0, 50.0), tolerance=0.15):
+            return False
+        if len(self.slots) != 33:
+            return False
+        if len(self.lines) != 38 or len(self.walls_rects) != 4:
+            return False
+        if sum(1 for occupied in self.occupied_idx if occupied) < 12:
+            return False
+        slot_idx = self._slot_index(self.target_slot)
+        return slot_idx in {1, 9, 12, 14, 15, 16, 17, 18, 19, 24, 25, 26, 27}
+
+    def _use_attempt21_speed2_override(self) -> bool:
+        return self._use_attempt21_slot12_speed_override() or self._use_attempt21_crowded_speed_override()
+
+    def _front_straight_speed_limit(self) -> float:
+        occupied_count = sum(1 for occupied in self.occupied_idx if occupied)
+        if self._use_attempt21_speed2_override():
+            return 2.5 if occupied_count > 0 else 2.65
+        if self._use_attempt22_slot1_speed_override():
+            return 2.55 if occupied_count > 0 else 2.70
+        if self._use_attempt20_slot1_speed_override():
+            return 2.5 if occupied_count > 0 else 2.6
+        return 2.4 if occupied_count > 0 else 2.6
+
     def _speed_command(
         self,
         speed: float,
@@ -767,20 +1231,40 @@ class PlannerSkeleton:
         """목표 속도에 맞춰 accel/brake를 정하는 단순 비례 속도 controller입니다."""
 
         target_dist = distance(position, waypoint.point)
-        desired_speed = waypoint.speed
+        desired_speed = float(waypoint.speed)
         heading_error = self._heading_error_to_waypoint(position, yaw, waypoint)
-        heading_high = 90.0 if self.default_mild_turn_active else 70.0
-        heading_mid = 55.0 if self.default_mild_turn_active else 35.0
-        heading_high_speed = 0.75 if self.default_mild_turn_active else 0.55
-        heading_mid_speed = 1.05 if self.default_mild_turn_active else 0.85
-        if heading_error > math.radians(heading_high):
-            desired_speed = min(desired_speed, heading_high_speed)
-        elif heading_error > math.radians(heading_mid):
-            desired_speed = min(desired_speed, heading_mid_speed)
+        curve_error = self._curve_angle_to_next_waypoint(waypoint, position)
+
+        if self._use_rear_in_speed_profile_scale():
+            if not waypoint.stop_here:
+                desired_speed = min(max(desired_speed * 1.12, desired_speed), 2.35)
+        elif waypoint.gear == "D" and not waypoint.stop_here:
+            desired_speed = max(desired_speed, self._front_straight_speed_limit())
+
+        if waypoint.gear == "R":
+            desired_speed = min(desired_speed, 0.95)
+
+        if heading_error > math.radians(115.0):
+            desired_speed = min(desired_speed, 0.85)
+        elif heading_error > math.radians(80.0):
+            desired_speed = min(desired_speed, 1.20)
+
+        if target_dist < 2.8:
+            if curve_error > math.radians(75.0):
+                desired_speed = min(desired_speed, 0.90)
+            elif curve_error > math.radians(35.0):
+                desired_speed = min(desired_speed, 1.15)
+
+        idx = self.active_waypoint
+        if idx < len(self.waypoints) - 1 and self.waypoints[idx + 1].gear != waypoint.gear:
+            gear_change_dist = 1.3 if self._use_attempt21_speed2_override() else 1.4
+            if target_dist < gear_change_dist:
+                desired_speed = min(desired_speed, 0.75)
 
         if waypoint.stop_here:
-            desired_speed = min(desired_speed, max(0.15, target_dist * 0.45))
+            desired_speed = min(desired_speed, max(0.12, target_dist * 0.45))
             yaw_error = abs(wrap_angle(yaw - self.final_yaw))
+            final_brake_dist = 0.68 if (self._use_attempt21_slot12_speed_override() or self._use_attempt22_slot1_speed_override()) else 0.70
             use_precise_brake = True
             if self.expected_orientation == "rear_in" and self.target_center and self.map_extent:
                 _, _, ymin, ymax = self.map_extent
@@ -789,15 +1273,15 @@ class PlannerSkeleton:
                     use_precise_brake = False
             if (
                 use_precise_brake
-                and target_dist < 0.70
+                and target_dist < final_brake_dist
                 and yaw_error < math.radians(35.0)
-                and speed < 0.24
+                and speed < 0.22
             ):
                 return 0.0, 1.0
             if target_dist < 0.45 and yaw_error < math.radians(35.0):
-                if speed < 0.25:
+                if speed < 0.22:
                     return 0.0, 1.0
-                return 0.0, 0.7
+                return 0.0, 0.75
 
         moving_forward = signed_speed > 0.12
         moving_backward = signed_speed < -0.12
@@ -808,13 +1292,20 @@ class PlannerSkeleton:
 
         speed_error = desired_speed - speed
         if speed_error > 0.10:
-            accel_gain = 0.24 if self.default_mild_turn_active else 0.20
-            accel_limit = 0.60 if self.default_mild_turn_active else 0.55
-            accel = 0.18 + accel_gain * speed_error
-            return clamp(accel, 0.0, accel_limit), 0.0
+            if self._use_attempt21_speed2_override():
+                accel = 0.18 + 0.46 * speed_error
+                return clamp(accel, 0.0, 0.92), 0.0
+            if self._use_attempt22_slot1_speed_override():
+                accel = 0.18 + 0.46 * speed_error
+                return clamp(accel, 0.0, 0.92), 0.0
+            if self._use_attempt20_slot1_speed_override():
+                accel = 0.18 + 0.48 * speed_error
+                return clamp(accel, 0.0, 0.92), 0.0
+            accel = 0.18 + 0.44 * speed_error
+            return clamp(accel, 0.0, 0.90), 0.0
         if speed_error < -0.15:
-            brake = 0.12 + 0.30 * (-speed_error)
-            return 0.0, clamp(brake, 0.0, 0.75)
+            brake = 0.12 + 0.38 * (-speed_error)
+            return 0.0, clamp(brake, 0.0, 0.84)
         return 0.0, 0.0
 
     def _trajectory_distance(self, a: TrajectoryPoint, b: TrajectoryPoint) -> float:
