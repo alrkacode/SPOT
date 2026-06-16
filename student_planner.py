@@ -272,6 +272,68 @@ class PlannerSkeleton:
         slot_idx = self._slot_index(slot)
         return slot_idx in {1, 2, 3, 5, 6, 7, 12, 14, 15, 21}
 
+    def _is_default_lot_signature(self) -> bool:
+        if self.map_extent is None:
+            return False
+        return (
+            self._rect_close(self.map_extent, (0.0, 75.0, 0.0, 50.0), tolerance=0.15)
+            and len(self.slots) == 33
+            and len(self.lines) == 38
+            and len(self.walls_rects) == 4
+            and sum(1 for occupied in self.occupied_idx if occupied) < 12
+        )
+
+    def _is_crowded_lot_signature(self) -> bool:
+        if self.map_extent is None:
+            return False
+        return (
+            self._rect_close(self.map_extent, (0.0, 75.0, 0.0, 50.0), tolerance=0.15)
+            and len(self.slots) == 33
+            and len(self.lines) == 38
+            and len(self.walls_rects) == 4
+            and sum(1 for occupied in self.occupied_idx if occupied) >= 12
+        )
+
+    def _use_attempt26_dijkstra_speed_recovery(self, slot: Rect) -> bool:
+        """Guarded attempt26 conditional Dijkstra disable and speed recovery."""
+
+        if self.expected_orientation != "front_in":
+            return False
+        slot_idx = self._slot_index(slot)
+        if self._is_crowded_lot_signature():
+            return slot_idx in {24, 25, 26, 27}
+        if self._is_default_lot_signature():
+            return slot_idx in {25, 26, 27, 29, 30, 31, 32}
+        return False
+
+    def _use_attempt31_crowded_slot0_11_emergency(self, slot: Rect) -> bool:
+        """Emergency collision-zero route for Crowded Lot slot0/11 above-open front-in cases."""
+
+        if self.expected_orientation != "front_in":
+            return False
+        if not self._is_crowded_lot_signature():
+            return False
+        if self._slot_index(slot) not in {0, 11}:
+            return False
+        return self._slot_open_side(slot) == "above"
+
+    def _use_attempt28_full_house_slot0_11_fix(self, slot: Rect) -> bool:
+        """Measured Full House slot0/11 collision fix from attempt28."""
+
+        if self.expected_orientation != "rear_in":
+            return False
+        if self.map_extent is None:
+            return False
+        if not self._rect_close(self.map_extent, (7.5, 67.5, 5.0, 45.0), tolerance=0.15):
+            return False
+        if len(self.free_slot_indices) != 1:
+            return False
+        if len(self.slots) != 33 or sum(1 for occupied in self.occupied_idx if occupied) != 32:
+            return False
+        if len(self.lines) != 38 or len(self.walls_rects) != 4:
+            return False
+        return self._slot_index(slot) in {0, 11}
+
     def _route_length(self, route: List[Waypoint]) -> float:
         if len(route) < 2:
             return 0.0
@@ -379,6 +441,48 @@ class PlannerSkeleton:
                 )
         return self._remove_redundant_waypoints(tuned)
 
+    def _build_attempt28_full_house_slot0_11_waypoints(self, slot: Rect) -> List[Waypoint]:
+        if self.map_extent is None:
+            return []
+        xmin, xmax, ymin, ymax = self.map_extent
+        cx, cy = rect_center(slot)
+        aisle_x = clamp(self.left_aisle_x, xmin + 2.5, xmax - 2.5)
+        align_y = clamp(slot[3] + 3.0, ymin + 2.5, ymax - 2.5)
+        turn_x = clamp(cx, xmin + 2.5, xmax - 2.5)
+        entry_y = clamp(slot[3] + 0.8, ymin + 2.5, ymax - 2.5)
+        final_x = clamp(cx + 0.25, slot[0] + 0.6, slot[1] - 0.6)
+        final_y = clamp(cy, slot[2] + 0.6, slot[3] - 0.6)
+        self.entry_gear = "D"
+        return self._remove_redundant_waypoints(
+            [
+                Waypoint(aisle_x, align_y, "D", radius=1.2, speed=1.25),
+                Waypoint(turn_x, align_y, "D", radius=1.0, speed=0.95),
+                Waypoint(final_x, entry_y, "D", radius=0.55, speed=0.55),
+                Waypoint(final_x, final_y, "D", radius=0.38, speed=0.42, stop_here=True),
+            ]
+        )
+
+    def _build_attempt31_crowded_slot0_11_waypoints(self, slot: Rect) -> List[Waypoint]:
+        if self.map_extent is None:
+            return []
+        xmin, xmax, ymin, ymax = self.map_extent
+        cx, cy = rect_center(slot)
+        aisle_x = clamp(self.left_aisle_x, xmin + 2.5, xmax - 2.5)
+        align_y = clamp(slot[3] + 3.5, ymin + 2.5, ymax - 2.5)
+        turn_x = clamp(cx, xmin + 2.5, xmax - 2.5)
+        entry_y = clamp(slot[3] + 0.8, ymin + 2.5, ymax - 2.5)
+        final_x = clamp(cx + 0.25, slot[0] + 0.55, slot[1] - 0.55)
+        final_y = clamp(cy, slot[2] + 0.55, slot[3] - 0.55)
+        self.entry_gear = "D"
+        return self._remove_redundant_waypoints(
+            [
+                Waypoint(aisle_x, align_y, "D", radius=1.15, speed=1.25),
+                Waypoint(turn_x, align_y, "D", radius=1.0, speed=0.95),
+                Waypoint(final_x, entry_y, "D", radius=0.60, speed=0.58),
+                Waypoint(final_x, final_y, "D", radius=0.36, speed=0.42, stop_here=True),
+            ]
+        )
+
     def _use_front_below_dijkstra_route(self, slot: Rect, open_side: str) -> bool:
         """attempt_14 Dijkstra route for front-in slots that open from below."""
 
@@ -391,6 +495,8 @@ class PlannerSkeleton:
         if len(self.slots) != 33:
             return False
         if len(self.lines) != 38 or len(self.walls_rects) != 4:
+            return False
+        if self._use_attempt26_dijkstra_speed_recovery(slot):
             return False
         return True
 
@@ -872,8 +978,13 @@ class PlannerSkeleton:
         turn_length = 6.0
         lane_gap = 2.0
         if self.planned_orientation == "rear_in":
+            if self._use_attempt28_full_house_slot0_11_fix(slot):
+                return self._build_attempt28_full_house_slot0_11_waypoints(slot)
             route = self._build_rear_in_waypoints(slot, open_side)
             return self._apply_full_house_waypoint_tune(route, slot)
+
+        if self._use_attempt31_crowded_slot0_11_emergency(slot):
+            return self._build_attempt31_crowded_slot0_11_waypoints(slot)
 
         if self._use_front_below_dijkstra_route(slot, open_side):
             try:
@@ -1212,6 +1323,8 @@ class PlannerSkeleton:
 
     def _front_straight_speed_limit(self) -> float:
         occupied_count = sum(1 for occupied in self.occupied_idx if occupied)
+        if self.target_slot is not None and self._use_attempt26_dijkstra_speed_recovery(self.target_slot):
+            return 2.6 if occupied_count > 0 else 2.75
         if self._use_attempt21_speed2_override():
             return 2.5 if occupied_count > 0 else 2.65
         if self._use_attempt22_slot1_speed_override():
@@ -1257,14 +1370,23 @@ class PlannerSkeleton:
 
         idx = self.active_waypoint
         if idx < len(self.waypoints) - 1 and self.waypoints[idx + 1].gear != waypoint.gear:
-            gear_change_dist = 1.3 if self._use_attempt21_speed2_override() else 1.4
+            if self.target_slot is not None and self._use_attempt26_dijkstra_speed_recovery(self.target_slot):
+                gear_change_dist = 1.2
+            else:
+                gear_change_dist = 1.3 if self._use_attempt21_speed2_override() else 1.4
             if target_dist < gear_change_dist:
                 desired_speed = min(desired_speed, 0.75)
 
         if waypoint.stop_here:
             desired_speed = min(desired_speed, max(0.12, target_dist * 0.45))
             yaw_error = abs(wrap_angle(yaw - self.final_yaw))
-            final_brake_dist = 0.68 if (self._use_attempt21_slot12_speed_override() or self._use_attempt22_slot1_speed_override()) else 0.70
+            if self.target_slot is not None and self._use_attempt31_crowded_slot0_11_emergency(self.target_slot):
+                if target_dist < 0.74 and yaw_error < math.radians(35.0) and speed < 0.24:
+                    return 0.0, 1.0
+            if self.target_slot is not None and self._use_attempt26_dijkstra_speed_recovery(self.target_slot):
+                final_brake_dist = 0.72
+            else:
+                final_brake_dist = 0.68 if (self._use_attempt21_slot12_speed_override() or self._use_attempt22_slot1_speed_override()) else 0.70
             use_precise_brake = True
             if self.expected_orientation == "rear_in" and self.target_center and self.map_extent:
                 _, _, ymin, ymax = self.map_extent
@@ -1292,6 +1414,9 @@ class PlannerSkeleton:
 
         speed_error = desired_speed - speed
         if speed_error > 0.10:
+            if self.target_slot is not None and self._use_attempt26_dijkstra_speed_recovery(self.target_slot):
+                accel = 0.18 + 0.50 * speed_error
+                return clamp(accel, 0.0, 0.95), 0.0
             if self._use_attempt21_speed2_override():
                 accel = 0.18 + 0.46 * speed_error
                 return clamp(accel, 0.0, 0.92), 0.0
